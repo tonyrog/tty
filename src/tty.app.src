@@ -1,0 +1,9 @@
+{application, tty,
+ [{description, "tty - raw tty_sl api"},
+  {vsn, git},
+  {modules, ["@@MODULES@@"]},
+%%  {mod, {App_app, []}},
+%%  {registered, [App_srv]},
+  {env, []},
+  {applications,[kernel,stdlib]}
+  ]}.
