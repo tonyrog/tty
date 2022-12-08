@@ -14,7 +14,7 @@
 -export([output/2]).
 -export([output_ready/1]).
 -export([output_sync/2]).
--export([get_line/1]).
+-export([get_line/1, get_line/2]).
 -export([move/2]).
 -export([insert/2]).
 -export([delete/2]).
@@ -54,7 +54,7 @@
 %% FIXME: how do we steel tty_sl without fuzz?
 open() ->
     put(?TTY_INPUT, []),
-    open_port({spawn,'tty_sl -c -e'}, [eof]).
+    open_port({spawn_driver,"tty_sl -c -e"}, [eof]).
 
 close(Port) ->
     port_close(Port).
@@ -276,16 +276,28 @@ translate_keys([]) ->
 %% {esc,$b} - backward word
 %% {esc,$f} - forward word
 
+-record(lst,
+	{
+	 port :: port(),  %% tty_sl
+	 mod,             %% module / fun for expand
+	 acs = [],        %% chars after cursor
+	 bcs = []         %% chars before cursor
+	}).
+
 -spec get_line(Port::port()) -> binary().
 get_line(Port) ->
-    get_line(Port, [], []).
+    get_line(Port, undefined).
 
-get_line(Port, After, Before) ->
+get_line(Port, UserMod) when is_atom(UserMod) ->
+    get_line_(#lst{port=Port, mod=UserMod}).
+
+get_line_(Lst=#lst{port=Port,acs=After,bcs=Before}) ->
     case input(Port) of
 	eof -> eof;
 	$\r ->
+	    move(Port, length(After)),
 	    output(Port, [$\s]),
-	    Line = list_to_binary(lists:reverse(Before)++After),
+	    Line = list_to_binary(lists:reverse(Before, After)),
 	    case is_blank_line(Line) of
 		true ->
 		    Line;
@@ -296,182 +308,226 @@ get_line(Port, After, Before) ->
 			{Above,Beneath} ->
 			    Hist=[{After,Before}|lists:reverse(Beneath,Above)],
 			    put(?HISTORY,{Hist,[]})
-		    end
-	    end,
-	    Line;
+		    end,
+		    Line
+	    end;
 	$\t ->
-	    %% FIXME: expand_fun!
-	    {Silent,Insert,Expand} = ffe:expand(Before),
+	    {Silent,Insert,Expand} =
+		try apply(Lst#lst.mod, expand, [Lst#lst.bcs]) of
+		    Res -> Res
+		catch error:_ ->
+			{no, <<"">>, []}
+		end,
 	    if Silent =:= yes -> ok;
 	       Silent =:= no -> beep(Port)
 	    end,
-	    %% FIXME: build into expand fun
-	    ffe:format_word_list(0, Expand),
-	    Before1 = lists:reverse(binary_to_list(Insert),Before),
+	    format_word_list(Lst#lst.port, Expand),
+	    Before1 = lists:reverse(Insert, Before),
 	    if Expand =:= [], Insert =/= [] ->
-		    insert(Port, Insert);
+		    insert(Lst#lst.port, Insert);
 	       Expand =/= [] ->
-		    insert(Port, lists:reverse(Before1));
+		    insert(Lst#lst.port, lists:reverse(Before1));
 	       true ->
 		    ok
 	    end,
-	    get_line(Port, After, Before1);
+	    get_line_(Lst#lst{bcs=Before1});
 	$\b ->
-	    get_line_bs(Port, After, Before);
+	    backspace(Lst);
 	backspace ->
-	    get_line_bs(Port, After, Before);
+	    backspace(Lst);
 	$\^a ->
-	    get_line_beginning_of_line(Port, After, Before);
+	    beginning_of_line(Lst);
 	$\^b ->
-	    get_line_backward_char(Port, After, Before);
+	    backward_char(Lst);
 	$\^d ->
-	    get_line_delete_char(Port, After, Before);
+	    delete_char(Lst);
 	$\^e ->
-	    get_line_end_of_line(Port, After, Before);
+	    end_of_line(Lst);
 	$\^f ->
-	    get_line_forward_char(Port, After, Before);
+	    forward_char(Lst);
 	$\^k ->
-	    get_line_kill_to_end_of_line(Port, After, Before);
+	    kill_to_end_of_line(Lst);
 	$\^y ->
-	    get_line_insert_from_kill_buffer(Port, After, Before);
+	    insert_from_kill_buffer(Lst);
 	$\^p -> 
-	    get_line_previous_line(Port, After, Before);
+	    previous_line(Lst);
 	$\^n -> 
-	    get_line_next_line(Port, After, Before);
+	    next_line(Lst);
 	up -> 
-	    get_line_previous_line(Port, After, Before);
+	    previous_line(Lst);
 	down ->
-	    get_line_next_line(Port, After, Before);
+	    next_line(Lst);
 	left ->
-	    get_line_backward_char(Port, After, Before);
+	    backward_char(Lst);
 	right ->
-	    get_line_forward_char(Port, After, Before);
+	    forward_char(Lst);
 	Key when Key >= $\s, Key =< $~ ->
 	    insert(Port, [Key]),
-	    get_line(Port, After, [Key|Before]);
+	    get_line_(Lst#lst{bcs=[Key|Lst#lst.bcs]});
 	_Key ->
 	    beep(Port),
-	    get_line(Port, After, Before)
+	    get_line_(Lst)
     end.
+
+%% emit expanded word lists
+format_word_list(_Out, []) ->
+    ok;
+format_word_list(TTY, WordNameList) ->
+    output(TTY, "\r\n"),
+    Width = lists:max([length(WordName) || WordName <- WordNameList])+1,
+    format_lines(TTY, WordNameList, 76, 76, Width).
+
+format_lines(TTY, [Word|WordNameList], LineLength, Remain, Width) ->
+    if Remain < 0; Remain - Width < 0 ->
+	    output(TTY, "\r\n"),
+	    N = emit_counted_string(TTY, Word, Width),
+	    format_lines(TTY, WordNameList, LineLength, LineLength-N, Width);
+       true ->
+	    N = emit_counted_string(TTY, Word, Width),
+	    format_lines(TTY, WordNameList, LineLength, Remain-N, Width)
+    end;
+format_lines(TTY, [], LineLength, Remain, _Width) ->
+    if LineLength =/= Remain ->
+	    output(TTY, "\r\n");
+       true ->
+	    ok
+    end.
+
+emit_counted_string(TTY, WordName, Width) ->
+    N = length(WordName),
+    if N < Width ->
+	    output(TTY, WordName),
+	    output(TTY, lists:duplicate(Width-N,$\s)),
+	    Width;
+       true ->
+	    output(TTY, WordName),
+	    N
+    end.
+
 
 is_blank_line(<<$\s,Cs/binary>>) -> is_blank_line(Cs);
 is_blank_line(<<$\t,Cs/binary>>) -> is_blank_line(Cs);
 is_blank_line(<<>>) -> true;
 is_blank_line(_) -> false.
     
-get_line_delete_char(Port, After, Before) ->
-    case After of
+delete_char(Lst) ->
+    case Lst#lst.acs of
 	[] ->
-	    beep(Port), %% option?
-	    get_line(Port, After, Before);
+	    beep(Lst#lst.port), %% option?
+	    get_line_(Lst);
 	[_|After1] ->
-	    delete(Port, 1),
-	    get_line(Port, After1, Before)
+	    delete(Lst#lst.port, 1),
+	    get_line_(Lst#lst{acs=After1 })
     end.
 
-get_line_backward_char(Port, After, Before) ->
-    case Before of
+backward_char(Lst) ->
+    case Lst#lst.bcs of
 	[] ->
-	    beep(Port), %% option?
-	    get_line(Port, After, Before);
+	    beep(Lst#lst.port), %% option?
+	    get_line_(Lst);
 	[Char|Before1] ->
-	    move(Port, -1),
-	    get_line(Port, [Char|After], Before1)
+	    move(Lst#lst.port, -1),
+	    get_line_(Lst#lst{acs=[Char|Lst#lst.acs], bcs=Before1})
     end.
 
-get_line_forward_char(Port, After, Before) ->
-    case After of
+forward_char(Lst) ->
+    case Lst#lst.acs of
+	[] ->
+	    beep(Lst#lst.port), %% option?
+	    get_line_(Lst);
 	[Char|After1] ->
-	    move(Port, 1),
-	    get_line(Port, After1, [Char|Before]);
-	[] ->
-	    beep(Port), %% option?
-	    get_line(Port, After, Before)
+	    move(Lst#lst.port, 1),
+	    get_line_(Lst#lst{acs=After1, bcs=[Char|Lst#lst.bcs]})
     end.
 
-get_line_end_of_line(Port, After, Before) ->
-    case After of
+end_of_line(Lst) ->
+    case Lst#lst.acs of
 	[] ->
-	    beep(Port),
-	    get_line(Port, After, Before);
-	_ ->
-	    move(Port, length(After)),
-	    get_line(Port, [], lists:reverse(After,Before))
+	    beep(Lst#lst.port),
+	    get_line_(Lst);
+	After ->
+	    move(Lst#lst.port, length(After)),
+	    get_line_(Lst#lst{acs=[], bcs=lists:reverse(After,Lst#lst.bcs)})
     end.
     
-get_line_beginning_of_line(Port, After, Before) ->
-    case Before of
+beginning_of_line(Lst) ->
+    case Lst#lst.bcs of
 	[] ->
-	    beep(Port),
-	    get_line(Port, After, Before);
+	    beep(Lst#lst.port),
+	    get_line_(Lst);
 	_ ->
-	    move(Port, -length(Before)),
-	    get_line(Port, lists:reverse(Before,After), [])
+	    move(Lst#lst.port, -length(Lst#lst.bcs)),
+	    get_line_(Lst#lst{ acs=lists:reverse(Lst#lst.bcs,Lst#lst.acs),
+			       bcs=[]})
     end.
     
-get_line_bs(Port, After, Before) ->
-    case Before of
+backspace(Lst) ->
+    case Lst#lst.bcs of
 	[_|Before1] ->
-	    delete(Port, -1),
-	    get_line(Port, After, Before1);
+	    delete(Lst#lst.port, -1),
+	    get_line_(Lst#lst{bcs=Before1});
 	[] ->
-	    beep(Port),
-	    get_line(Port, After, Before)
+	    beep(Lst#lst.port),
+	    get_line_(Lst)
     end.
 
-get_line_kill_to_end_of_line(Port, After, Before) ->
-    case After of
+kill_to_end_of_line(Lst) ->
+    case Lst#lst.acs of
 	[] ->
 	    put(?KILL_BUFFER, []),
-	    get_line(Port, After, Before);
-	_ ->
-	    delete(Port, length(After)),
+	    get_line_(Lst);
+	After ->
+	    delete(Lst#lst.port, length(After)),
 	    put(?KILL_BUFFER, After),
-	    get_line(Port, [], Before)
+	    get_line_(Lst#lst { acs=[] })
     end.
 
-get_line_insert_from_kill_buffer(Port, After, Before) ->
+insert_from_kill_buffer(Lst) ->
     case get(?KILL_BUFFER) of
 	[] ->
-	    get_line(Port, After, Before);
+	    get_line_(Lst);
 	Yank ->
-	    insert(Port, Yank),
-	    get_line(Port, After, lists:reverse(Yank, Before))
+	    insert(Lst#lst.port, Yank),
+	    get_line_(Lst#lst { bcs = lists:reverse(Yank, Lst#lst.bcs) })
     end.
 
-get_line_previous_line(Port, After, Before) ->
+previous_line(Lst) ->
     case get(?HISTORY) of
 	undefined ->
-	    beep(Port),
-	    get_line(Port, After, Before);
+	    beep(Lst#lst.port),
+	    get_line_(Lst);
 	{[],_} ->
-	    beep(Port),
-	    get_line(Port, After, Before);
+	    beep(Lst#lst.port),
+	    get_line_(Lst);
 	{[{A,B}|Above],Beneath} ->
-	    move(Port, -length(Before)),
-	    delete(Port, length(After)+length(Before)),
+	    AL = length(Lst#lst.acs),
+	    BL = length(Lst#lst.bcs),
+	    move(Lst#lst.port, -BL),
+	    delete(Lst#lst.port, AL+BL),
 	    put(?HISTORY, {Above, [{A,B}|Beneath]}),
-	    insert(Port, lists:reverse(B)),
-	    insert(Port, A),
-	    move(Port, -length(A)),
-	    get_line(Port, A, B)
+	    insert(Lst#lst.port, lists:reverse(B)),
+	    insert(Lst#lst.port, A),
+	    move(Lst#lst.port, -length(A)),
+	    get_line_(Lst#lst{acs=A, bcs=B})
     end.
     
 
-get_line_next_line(Port, After, Before) ->
+next_line(Lst) ->
     case get(?HISTORY) of
 	undefined ->
-	    beep(Port),
-	    get_line(Port, After, Before);
+	    beep(Lst#lst.port),
+	    get_line_(Lst);
 	{_,[]} ->
-	    beep(Port),
-	    get_line(Port, After, Before);
+	    beep(Lst#lst.port),
+	    get_line_(Lst);
 	{Above,[{A,B}|Beneath]} ->
-	    move(Port, -length(Before)),
-	    delete(Port, length(After)+length(Before)),
+	    AL = length(Lst#lst.acs),
+	    BL = length(Lst#lst.bcs),
+	    move(Lst#lst.port, -BL),
+	    delete(Lst#lst.port, AL+BL),
 	    put(?HISTORY, {[{A,B}|Above], Beneath}),
-	    insert(Port, lists:reverse(B)),
-	    insert(Port, A),
-	    move(Port, -length(A)),
-	    get_line(Port, A, B)
+	    insert(Lst#lst.port, lists:reverse(B)),
+	    insert(Lst#lst.port, A),
+	    move(Lst#lst.port, -length(A)),
+	    get_line_(Lst#lst{acs=A,bcs=B})
     end.
