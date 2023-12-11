@@ -7,6 +7,8 @@
 
 -module(tty).
 
+-on_load(load/0).
+-export([load/0]).
 -export([open/0]).
 -export([close/1]).
 -export([input/1]).
@@ -51,13 +53,35 @@
 -define(KILL_BUFFER, kill_buffer).
 -define(HISTORY, history).
 
+load() ->
+    Dir = code:priv_dir(?MODULE),
+    erl_ddll:load_driver(Dir, "tty_drv").
+
+
 %% FIXME: how do we steel tty_sl without fuzz?
 open() ->
-    put(?TTY_INPUT, []),
-    open_port({spawn_driver,"tty_sl -c -e"}, [eof]).
+    try open_port({spawn_driver,"tty_drv -c -e"}, [eof]) of
+	TTY ->
+	    put(?TTY_INPUT, []),
+	    init_tty_sl(TTY)
+    catch
+	error:_Reason ->
+	    case prim_tty:isatty(stdin) =:= true andalso 
+		 prim_tty:isatty(stdout) =:= true of
+		true ->
+		    put(?TTY_INPUT, []),
+		    user
+	    end
+    end.
+		   
+init_tty_sl(TTY) ->
+    erlang:register(standard_io, TTY),
+    TTY.
 
-close(Port) ->
-    port_close(Port).
+close(Port) when is_port(Port) ->
+    port_close(Port);
+close(user) ->
+    ok.
 
 input(Port) ->
     case get(?TTY_INPUT) of
@@ -100,34 +124,46 @@ outputf(TTY, Fmt) ->
 outputf(TTY, Fmt, Args) ->
     output(TTY, io_lib:format(Fmt, Args)).
 
-output(Port, Cs) ->
-    port_command(Port, [?OP_PUTC|unicode:characters_to_binary(Cs,utf8)]).
+output(Port, Cs) when is_port(Port) ->
+    port_command(Port, [?OP_PUTC|unicode:characters_to_binary(Cs,utf8)]);
+output(user, Cs) ->
+    io:put_chars(user, unicode:characters_to_binary(Cs,utf8)).
+
 
 output_sync(Port, Cs) ->
     port_command(Port,[?OP_PUTC_SYNC|unicode:characters_to_binary(Cs,utf8)]).
 
-move(Port, N) ->
-    port_command(Port, [?OP_MOVE|<<N:16>>]).
+move(Port, N) when is_port(Port) ->    
+    port_command(Port, [?OP_MOVE|<<N:16>>]);
+move(user, N) -> 
+    {ok, Chars} = prim_tty:tgoto("\e[%dC", N),
+    io:put_chars(user, Chars).
 
-insert(Port,Cs) ->
+
+insert(Port,Cs)  when is_port(Port) ->
     port_command(Port, [?OP_INSC|unicode:characters_to_binary(Cs,utf8)]).
 
-delete(Port, N) ->
+delete(Port, N)  when is_port(Port) ->
     port_command(Port, [?OP_DELC|<<N:16>>]).
 
-beep(Port) ->
+beep(Port)  when is_port(Port) ->
     port_command(Port, [?OP_BEEP]).
 
 % Let driver report window geometry,
 % definitely outside of the common interface
-get_tty_geometry(Port) ->
+get_tty_geometry(Port) when is_port(Port) ->
     case (catch port_control(Port,?CTRL_OP_GET_WINSIZE,[])) of
 	List when length(List) =:= 8 -> 
 	    <<W:32/native,H:32/native>> = list_to_binary(List),
 	    {W,H};
 	_ ->
 	    error
-    end.
+    end;
+get_tty_geometry(user) ->
+    {ok,W} = io:columns(),
+    {ok,H} = io:rows(),
+    {W, H}.
+
 get_unicode_state(Port) ->
     case (catch port_control(Port,?CTRL_OP_GET_UNICODE_STATE,[])) of
 	[Int] when Int > 0 -> 

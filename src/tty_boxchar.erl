@@ -2,6 +2,7 @@
 %%% @copyright (C) 2021, Tony Rogvall
 %%% @doc
 %%%    Test unicode box drawing characters
+%%%%   erl -noshell -s tty_boxchar demo 
 %%% @end
 %%% Created :  8 Dec 2021 by Tony Rogvall <tony@rogvall.se>
 
